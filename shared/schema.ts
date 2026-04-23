@@ -6,6 +6,7 @@ import { z } from "zod";
 // status flow: drafting → voting → executing → complete
 export const sessions = sqliteTable("sessions", {
   id: integer("id").primaryKey({ autoIncrement: true }),
+  provider: text("provider").notNull().default("og"), // og | phala
   status: text("status").notNull().default("drafting"), // drafting | voting | executing | complete
   prompt: text("prompt"),           // the single submitted prompt
   mergedPrompt: text("merged_prompt"), // kept for compatibility, same as prompt

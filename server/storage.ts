@@ -7,10 +7,10 @@ import type { Session, Vote, InsertSession, InsertVote } from "@shared/schema";
 const sqlite = new Database("consensus.db");
 export const db = drizzle(sqlite);
 
-// Create tables — simplified: no inputs table, sessions use 'drafting' as initial status
 sqlite.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL DEFAULT 'og',
     status TEXT NOT NULL DEFAULT 'drafting',
     prompt TEXT,
     merged_prompt TEXT,
@@ -29,11 +29,12 @@ sqlite.exec(`
     voted_at INTEGER NOT NULL
   );
 `);
+try { sqlite.exec(`ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'og'`); } catch { /* already exists */ }
 
 export interface IStorage {
-  getActiveSession(): Session | undefined;
-  getLatestSession(): Session | undefined;
-  createSession(): Session;
+  getActiveSession(provider: string): Session | undefined;
+  getLatestSession(provider: string): Session | undefined;
+  createSession(provider: string): Session;
   updateSession(id: number, updates: Partial<Session>): Session | undefined;
   getVotesForSession(sessionId: number): Vote[];
   submitVote(vote: InsertVote): Vote;
@@ -41,20 +42,21 @@ export interface IStorage {
 }
 
 export const storage: IStorage = {
-  getLatestSession() {
-    return db.select().from(sessions).orderBy(sessions.id).all().slice(-1)[0];
+  getLatestSession(provider) {
+    return db.select().from(sessions).where(eq(sessions.provider, provider)).orderBy(sessions.id).all().slice(-1)[0];
   },
 
-  getActiveSession() {
+  getActiveSession(provider) {
     return (
-      db.select().from(sessions).where(eq(sessions.status, "drafting")).get() ??
-      db.select().from(sessions).where(eq(sessions.status, "voting")).get() ??
-      db.select().from(sessions).where(eq(sessions.status, "executing")).get()
+      db.select().from(sessions).where(and(eq(sessions.provider, provider), eq(sessions.status, "drafting"))).get() ??
+      db.select().from(sessions).where(and(eq(sessions.provider, provider), eq(sessions.status, "voting"))).get() ??
+      db.select().from(sessions).where(and(eq(sessions.provider, provider), eq(sessions.status, "executing"))).get()
     );
   },
 
-  createSession() {
+  createSession(provider) {
     return db.insert(sessions).values({
+      provider,
       status: "drafting",
       createdAt: Date.now(),
     }).returning().get();

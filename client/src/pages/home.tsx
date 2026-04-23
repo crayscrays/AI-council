@@ -83,7 +83,8 @@ function Logo() {
   );
 }
 
-export default function HomePage() {
+export default function CouncilPage({ provider }: { provider: "og" | "phala" }) {
+  const apiBase = `/api/${provider}`;
   const [promptText, setPromptText] = useState("");
   const [selectedVoter, setSelectedVoter] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
@@ -91,7 +92,7 @@ export default function HomePage() {
   const { toast } = useToast();
 
   const { data, isLoading } = useQuery<SessionData>({
-    queryKey: ["/api/session"],
+    queryKey: [`${apiBase}/session`],
     refetchInterval: (data) => {
       const status = data?.state?.data?.session?.status;
       if (status === "executing") return 2000;
@@ -102,26 +103,26 @@ export default function HomePage() {
 
   // Poll result when executing
   const { data: resultData } = useQuery<SessionData>({
-    queryKey: ["/api/session", data?.session?.id, "result"],
+    queryKey: [`${apiBase}/session`, data?.session?.id, "result"],
     enabled: !!data?.session?.id && data?.session?.status === "executing",
     refetchInterval: 2000,
     queryFn: async () => {
-      const res = await apiRequest("GET", `/api/session/${data!.session.id}/result`);
+      const res = await apiRequest("GET", `${apiBase}/session/${data!.session.id}/result`);
       return res.json();
     },
   });
 
   useEffect(() => {
     if (resultData?.session?.status === "complete") {
-      qc.setQueryData(["/api/session"], resultData);
+      qc.setQueryData([`${apiBase}/session`], resultData);
     }
-  }, [resultData, qc]);
+  }, [resultData, qc, apiBase]);
 
   // Submit the single prompt → moves session to voting
   const submitPrompt = useMutation({
     mutationFn: async () => {
       if (!data?.session) throw new Error("No session");
-      const res = await apiRequest("POST", `/api/session/${data.session.id}/prompt`, {
+      const res = await apiRequest("POST", `${apiBase}/session/${data.session.id}/prompt`, {
         prompt: promptText,
       });
       if (!res.ok) {
@@ -131,7 +132,7 @@ export default function HomePage() {
       return res.json();
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["/api/session"] });
+      qc.invalidateQueries({ queryKey: [`${apiBase}/session`] });
       toast({ title: "Prompt submitted", description: "Now open to votes." });
     },
     onError: (e: Error) => toast({ title: "Error", description: e.message, variant: "destructive" }),
@@ -141,7 +142,7 @@ export default function HomePage() {
   const submitVote = useMutation({
     mutationFn: async ({ approve }: { approve: boolean }) => {
       if (!data?.session || selectedVoter === null) throw new Error("No session or voter selected");
-      const res = await apiRequest("POST", `/api/session/${data.session.id}/vote`, {
+      const res = await apiRequest("POST", `${apiBase}/session/${data.session.id}/vote`, {
         userId: selectedVoter,
         userName: USER_NAMES[selectedVoter - 1],
         approve,
@@ -154,7 +155,7 @@ export default function HomePage() {
     },
     onSuccess: (result) => {
       setSelectedVoter(null);
-      qc.invalidateQueries({ queryKey: ["/api/session"] });
+      qc.invalidateQueries({ queryKey: [`${apiBase}/session`] });
       toast({ title: "Vote recorded" });
     },
     onError: (e: Error) => toast({ title: "Error", description: e.message, variant: "destructive" }),
@@ -163,13 +164,13 @@ export default function HomePage() {
   // New session
   const newSession = useMutation({
     mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/session/new");
+      const res = await apiRequest("POST", `${apiBase}/session/new`);
       return res.json();
     },
     onSuccess: () => {
       setSelectedVoter(null);
       setPromptText("");
-      qc.invalidateQueries({ queryKey: ["/api/session"] });
+      qc.invalidateQueries({ queryKey: [`${apiBase}/session`] });
       toast({ title: "New round started" });
     },
   });
@@ -223,7 +224,7 @@ export default function HomePage() {
                 AI<span className="text-primary">Council</span>
               </h1>
               <p className="text-[10px] text-muted-foreground font-mono uppercase tracking-widest">
-                OpenGradient TEE · Verifiable Inference
+                {provider === "phala" ? "Phala Network TEE · Verifiable Inference" : "OpenGradient TEE · Verifiable Inference"}
               </p>
             </div>
           </div>
@@ -264,7 +265,7 @@ export default function HomePage() {
               </h2>
             </div>
             <p className="text-xs text-muted-foreground font-mono mb-4">
-              Write the prompt that will be sent to the AI once a majority (6/10) of council members approve it.
+              Write the prompt that will be sent to the AI once 1 council member approves it.
             </p>
             <Textarea
               data-testid="input-prompt"
@@ -322,7 +323,7 @@ export default function HomePage() {
               <div className="flex items-center justify-between mb-4">
                 <h3 className="font-mono text-sm font-semibold uppercase tracking-wide">Vote Progress</h3>
                 <span className="text-xs font-mono text-muted-foreground">
-                  {votes.length}/10 voted · need 6 to approve
+                  {votes.length}/1 voted · need 1 to approve
                 </span>
               </div>
 
@@ -448,7 +449,9 @@ export default function HomePage() {
             </div>
             <h2 className="font-mono font-bold text-lg text-foreground mb-2">Executing in TEE</h2>
             <p className="text-sm text-muted-foreground font-mono mb-1">
-              Prompt running inside OpenGradient's Intel TDX TEE node
+              {provider === "phala"
+                ? "Prompt running inside Phala Network's TEE node"
+                : "Prompt running inside OpenGradient's Intel TDX TEE node"}
             </p>
             <p className="text-xs text-muted-foreground/60 font-mono">
               Generating cryptographic attestation · settling proof on-chain...
@@ -474,8 +477,17 @@ export default function HomePage() {
                 <Zap className="w-4 h-4 text-primary" />
                 <h2 className="font-mono font-semibold text-sm uppercase tracking-wide">TEE Response</h2>
                 <Badge className="ml-auto text-[10px] font-mono bg-primary/15 text-primary border-primary/30">
-                  OpenGradient TEE
+                  {provider === "phala" ? "Phala TEE" : "OpenGradient TEE"}
                 </Badge>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 w-6 p-0 text-muted-foreground hover:text-primary"
+                  onClick={() => copyToClipboard(session.llmResponse ?? "")}
+                  data-testid="button-copy-response"
+                >
+                  <Copy className="w-3 h-3" />
+                </Button>
               </div>
               <div className="bg-muted/30 rounded-md p-4 border border-border/50 font-sans text-sm text-foreground leading-relaxed whitespace-pre-wrap">
                 {session.llmResponse}
@@ -527,6 +539,26 @@ export default function HomePage() {
                   </div>
                 )}
 
+                {!attestation.demo && provider === "phala" && (
+                  <div className="mb-3 flex flex-col gap-1.5">
+                    <a
+                      href="https://proof.t16z.com"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 text-xs font-mono text-purple hover:text-purple/80 underline underline-offset-2"
+                    >
+                      <Shield className="w-3 h-3" />
+                      Verify Phala TDX node attestation at proof.t16z.com ↗
+                    </a>
+                    {attestation.processingHash && (
+                      <p className="text-[10px] font-mono text-muted-foreground">
+                        Request ID: <span className="text-foreground/70">{attestation.processingHash as string}</span>
+                        {" "}— use this to correlate your request with Red Pill AI logs
+                      </p>
+                    )}
+                  </div>
+                )}
+
                 <div className="bg-background/60 rounded-md p-4 border border-border/50 overflow-x-auto hash-reveal">
                   <AttestationViewer data={attestation} />
                 </div>
@@ -559,11 +591,26 @@ export default function HomePage() {
       <footer className="border-t border-border mt-12 py-4">
         <div className="max-w-3xl mx-auto px-4 flex items-center justify-between">
           <p className="text-xs font-mono text-muted-foreground/50">
-            Powered by{" "}
-            <a href="https://opengradient.ai" target="_blank" rel="noopener noreferrer" className="text-primary/60 hover:text-primary transition-colors">
-              OpenGradient
-            </a>
-            {" "}Testnet TEE · Base Sepolia $OPG
+            {provider === "phala" ? (
+              <>
+                Powered by{" "}
+                <a href="https://red-pill.ai" target="_blank" rel="noopener noreferrer" className="text-purple/60 hover:text-purple transition-colors">
+                  Phala Network
+                </a>
+                {" "}· Intel TDX TEE via Red Pill AI ·{" "}
+                <a href="https://proof.t16z.com" target="_blank" rel="noopener noreferrer" className="text-purple/60 hover:text-purple transition-colors">
+                  Verify node ↗
+                </a>
+              </>
+            ) : (
+              <>
+                Powered by{" "}
+                <a href="https://opengradient.ai" target="_blank" rel="noopener noreferrer" className="text-primary/60 hover:text-primary transition-colors">
+                  OpenGradient
+                </a>
+                {" "}· Intel TDX TEE · Base mainnet $OPG
+              </>
+            )}
           </p>
           <p className="text-xs font-mono text-muted-foreground/40">
             Session #{session.id}
