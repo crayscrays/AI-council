@@ -7,34 +7,19 @@ import { z } from "zod";
 import { randomBytes, createHash } from "crypto";
 import { ethers } from "ethers";
 
-const TOTAL_USERS = 10;
-const MAJORITY = 6; // >5 = majority
+const TOTAL_VOTERS = 10;
+const MAJORITY = 6; // need ≥6 approvals to execute
 
 // OpenGradient x402 config
 const OG_LLM_ENDPOINT = "https://llmogevm.opengradient.ai/v1/chat/completions";
-const OG_CHAIN_ID = 10744; // OpenGradient mainnet (OUSDC)
-// Testnet alternative: Base Sepolia chain 84532 with $OPG token
 const OG_MODEL = process.env.OG_MODEL || "anthropic/claude-4.0-sonnet";
-
-function buildMergedPrompt(inputs: { userId: number; userName: string; content: string }[]): string {
-  const sorted = [...inputs].sort((a, b) => a.userId - b.userId);
-  const parts = sorted.map(
-    (inp) => `[${inp.userName} (User ${inp.userId})]: ${inp.content}`
-  );
-  return (
-    "The following inputs were contributed by 10 participants in a consensus round. " +
-    "Please synthesize all perspectives into a thoughtful, unified response:\n\n" +
-    parts.join("\n\n")
-  );
-}
 
 /**
  * Call OpenGradient's x402 TEE LLM endpoint.
- *
  * Flow:
- *  1. POST prompt → 402 response with X-PAYMENT-REQUIRED header
- *  2. Wallet signs the payment payload
- *  3. Re-POST with X-PAYMENT-SIGNATURE header → LLM response + on-chain settlement
+ *  1. POST → 402 with X-PAYMENT-REQUIRED header
+ *  2. Wallet signs payment payload
+ *  3. Re-POST with X-PAYMENT-SIGNATURE → LLM response + on-chain settlement
  */
 async function callOpenGradientTEE(
   prompt: string,
@@ -54,8 +39,6 @@ async function callOpenGradientTEE(
     ],
     max_tokens: 1024,
     temperature: 0.7,
-    // TEE mode: inference routed through Intel TDX node to Anthropic
-    // settlement_mode: SETTLE_METADATA records full prompt+response on-chain
     settlement_mode: process.env.OG_SETTLEMENT_MODE || "SETTLE_METADATA",
     inference_mode: "TEE",
   });
@@ -68,33 +51,30 @@ async function callOpenGradientTEE(
   });
 
   if (firstRes.status !== 402) {
-    // If not 402, might already be authorised (unlikely) or an error
     if (!firstRes.ok) {
       const err = await firstRes.text();
       throw new Error(`OpenGradient API error: ${firstRes.status} — ${err}`);
     }
-    // Unexpected 200 without payment — try to parse anyway
     const data = await firstRes.json() as any;
     return {
       response: data.choices?.[0]?.message?.content ?? "(No response)",
       paymentHash: "n/a",
       txHash: "n/a",
-      attestation: { note: "Responded without payment challenge (unexpected)", raw: data },
+      attestation: { note: "Responded without payment challenge", raw: data },
     };
   }
 
-  // Step 2: Parse payment requirement from header
+  // Step 2: Parse payment requirement
   const paymentRequiredHeader =
     firstRes.headers.get("X-PAYMENT-REQUIRED") ||
     firstRes.headers.get("PAYMENT-REQUIRED");
 
   if (!paymentRequiredHeader) {
-    throw new Error("OpenGradient returned 402 but no X-PAYMENT-REQUIRED header found");
+    throw new Error("OpenGradient returned 402 but no X-PAYMENT-REQUIRED header");
   }
 
   let paymentRequired: any;
   try {
-    // Header may be base64-encoded or raw JSON
     try {
       paymentRequired = JSON.parse(paymentRequiredHeader);
     } catch {
@@ -104,14 +84,13 @@ async function callOpenGradientTEE(
     throw new Error(`Failed to parse X-PAYMENT-REQUIRED header: ${paymentRequiredHeader.slice(0, 200)}`);
   }
 
-  // Step 3: Build and sign payment payload
+  // Step 3: Sign payment payload
   const paymentPayload = {
     ...paymentRequired,
     timestamp: Date.now(),
     nonce: randomBytes(16).toString("hex"),
   };
   const signature = await wallet.signMessage(JSON.stringify(paymentPayload));
-
   const paymentSignature = JSON.stringify({
     payload: paymentPayload,
     signature,
@@ -124,7 +103,7 @@ async function callOpenGradientTEE(
     headers: {
       "Content-Type": "application/json",
       "X-PAYMENT-SIGNATURE": paymentSignature,
-      "PAYMENT-SIGNATURE": paymentSignature, // include both variants
+      "PAYMENT-SIGNATURE": paymentSignature,
     },
     body,
   });
@@ -136,22 +115,18 @@ async function callOpenGradientTEE(
 
   const result = await secondRes.json() as any;
 
-  // Extract settlement info from response headers or body
   const paymentResponse =
     secondRes.headers.get("X-PAYMENT-RESPONSE") ||
     secondRes.headers.get("PAYMENT-RESPONSE");
 
   let txHash = "pending";
   let paymentHash = "pending";
-
   if (paymentResponse) {
     try {
       const pr = JSON.parse(paymentResponse);
       txHash = pr.tx_hash ?? pr.txHash ?? "pending";
       paymentHash = pr.payment_id ?? pr.paymentId ?? "pending";
-    } catch {
-      // ignore parse error
-    }
+    } catch {}
   }
 
   const llmContent =
@@ -174,35 +149,28 @@ async function callOpenGradientTEE(
       : "https://explorer.opengradient.ai",
     timestamp: new Date().toISOString(),
     verified: true,
-    note:
-      "Prompt routed through Intel TDX TEE node to Anthropic. TEE attestation proof posted and verified on OpenGradient blockchain by 2/3+ validators. With SETTLE_METADATA, full prompt and response are permanently recorded on-chain.",
+    note: "Prompt routed through Intel TDX TEE node to Anthropic. TEE attestation proof posted and verified on OpenGradient blockchain by 2/3+ validators.",
     verification: result.verification ?? null,
-    rawSettlement: paymentResponse ?? null,
   };
 
   return { response: llmContent, paymentHash, txHash, attestation };
 }
 
 export function registerRoutes(httpServer: Server, app: Express) {
-  // Get or create current session
+  // GET /api/session — get or create current session
   app.get("/api/session", (req, res) => {
     let session = storage.getActiveSession() ?? storage.getLatestSession();
-    if (!session) {
-      session = storage.createSession();
-    }
-    const inputs = storage.getInputsForSession(session.id);
+    if (!session) session = storage.createSession();
     const votes = storage.getVotesForSession(session.id);
     const attestation = session.attestationReport ? JSON.parse(session.attestationReport) : null;
-    res.json({ session, inputs, votes, attestation });
+    res.json({ session, votes, attestation });
   });
 
-  // Submit a user input
-  app.post("/api/session/:id/input", async (req, res) => {
+  // POST /api/session/:id/prompt — submit the single prompt (moves to voting)
+  app.post("/api/session/:id/prompt", async (req, res) => {
     const sessionId = parseInt(req.params.id);
     const schema = z.object({
-      userId: z.number().min(1).max(10),
-      userName: z.string().min(1).max(50),
-      content: z.string().min(1).max(2000),
+      prompt: z.string().min(1).max(5000),
     });
 
     const parsed = schema.safeParse(req.body);
@@ -214,53 +182,20 @@ export function registerRoutes(httpServer: Server, app: Express) {
     if (!session || session.id !== sessionId) {
       return res.status(404).json({ error: "Session not found" });
     }
-    if (session.status !== "collecting") {
-      return res.status(400).json({ error: "Session is no longer accepting inputs" });
+    if (session.status !== "drafting") {
+      return res.status(400).json({ error: "Session is not in drafting phase" });
     }
 
-    const existing = storage.getUserInput(sessionId, parsed.data.userId);
-    if (existing) {
-      return res.status(409).json({ error: "You have already submitted an input for this session." });
-    }
-
-    const input = storage.submitInput({
-      sessionId,
-      userId: parsed.data.userId,
-      userName: parsed.data.userName,
-      content: parsed.data.content,
-      submittedAt: Date.now(),
+    const updated = storage.updateSession(sessionId, {
+      status: "voting",
+      prompt: parsed.data.prompt,
+      mergedPrompt: parsed.data.prompt,
     });
 
-    const allInputs = storage.getInputsForSession(sessionId);
-
-    if (allInputs.length >= TOTAL_USERS) {
-      const merged = buildMergedPrompt(allInputs);
-      storage.updateSession(sessionId, { status: "reviewing", mergedPrompt: merged });
-    }
-
-    res.json({ input, totalInputs: allInputs.length });
+    res.json({ session: updated });
   });
 
-  // Lock prompt and transition to voting
-  app.post("/api/session/:id/lock", (req, res) => {
-    const sessionId = parseInt(req.params.id);
-    const session = storage.getActiveSession();
-    if (!session || session.id !== sessionId) {
-      return res.status(404).json({ error: "Session not found" });
-    }
-    if (!["collecting", "reviewing"].includes(session.status)) {
-      return res.status(400).json({ error: "Cannot lock in current state" });
-    }
-    const allInputs = storage.getInputsForSession(sessionId);
-    if (allInputs.length === 0) {
-      return res.status(400).json({ error: "No inputs to merge" });
-    }
-    const merged = buildMergedPrompt(allInputs);
-    const updated = storage.updateSession(sessionId, { status: "voting", mergedPrompt: merged });
-    res.json({ session: updated, mergedPrompt: merged });
-  });
-
-  // Submit a vote
+  // POST /api/session/:id/vote — cast approve/reject vote
   app.post("/api/session/:id/vote", async (req, res) => {
     const sessionId = parseInt(req.params.id);
     const schema = z.object({
@@ -299,37 +234,34 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const approveCount = allVotes.filter((v) => v.approve === 1).length;
     const rejectCount = allVotes.filter((v) => v.approve === 0).length;
 
+    // Majority approves → execute in TEE
     if (approveCount >= MAJORITY) {
       storage.updateSession(sessionId, { status: "executing" });
       executeTEE(sessionId).catch(console.error);
     }
 
-    if (rejectCount > TOTAL_USERS - MAJORITY) {
-      storage.updateSession(sessionId, { status: "collecting" });
+    // Impossible to reach majority → reset to drafting
+    if (rejectCount > TOTAL_VOTERS - MAJORITY) {
+      storage.updateSession(sessionId, { status: "drafting", prompt: null, mergedPrompt: null });
     }
 
     res.json({ vote, approveCount, rejectCount });
   });
 
-  // Get execution result (poll endpoint)
+  // GET /api/session/:id/result — poll for result
   app.get("/api/session/:id/result", (req, res) => {
     const sessionId = parseInt(req.params.id);
     const session = db.select().from(sessionsTable).where(eq(sessionsTable.id, sessionId)).get();
-
     if (!session) return res.status(404).json({ error: "Session not found" });
-
-    const sessionInputs = storage.getInputsForSession(sessionId);
     const sessionVotes = storage.getVotesForSession(sessionId);
-
     res.json({
       session,
-      inputs: sessionInputs,
       votes: sessionVotes,
       attestation: session.attestationReport ? JSON.parse(session.attestationReport) : null,
     });
   });
 
-  // Create a new session (reset)
+  // POST /api/session/new — start a new round
   app.post("/api/session/new", (req, res) => {
     const session = storage.createSession();
     res.json({ session });
@@ -339,33 +271,31 @@ export function registerRoutes(httpServer: Server, app: Express) {
 async function executeTEE(sessionId: number) {
   try {
     const session = db.select().from(sessionsTable).where(eq(sessionsTable.id, sessionId)).get();
-    if (!session?.mergedPrompt) throw new Error("No merged prompt found");
+    if (!session?.prompt) throw new Error("No prompt found");
 
     const privateKey = process.env.OG_PRIVATE_KEY || "";
     const nonce = randomBytes(32).toString("hex");
-    const promptHash = createHash("sha256").update(session.mergedPrompt).digest("hex");
+    const promptHash = createHash("sha256").update(session.prompt).digest("hex");
 
     let llmResponse: string;
     let attestation: object;
 
     if (!privateKey) {
-      // Demo mode — no wallet key configured
+      // Demo mode
       llmResponse = [
         "[DEMO MODE — OG_PRIVATE_KEY not set]\n",
-        "In production, the merged consensus prompt is sent to OpenGradient's decentralized TEE network.",
+        "In production, this prompt is sent to OpenGradient's decentralized TEE network.",
         `Model: ${OG_MODEL}`,
-        "The request routes through an Intel TDX TEE node which cryptographically attests the execution",
-        "and settles the proof on the OpenGradient blockchain (chain 10744), verified by 2/3+ validators.\n",
+        "Routed through an Intel TDX TEE node, cryptographically attested,",
+        "and the proof is settled on the OpenGradient blockchain (chain 10744).\n",
         `Prompt SHA-256: ${promptHash}\n`,
-        "To enable live execution, set OG_PRIVATE_KEY in your environment.",
-        "See README.md for wallet setup instructions.",
+        "Set OG_PRIVATE_KEY to enable live execution.",
       ].join("\n");
 
       attestation = {
         demo: true,
         provider: "OpenGradient (demo)",
         model: OG_MODEL,
-        settlementMode: process.env.OG_SETTLEMENT_MODE || "SETTLE_METADATA",
         inferenceMode: "TEE",
         teeType: "Intel TDX (hardware-attested) — NOT verified in demo",
         network: "OpenGradient Mainnet (chain 10744)",
@@ -375,15 +305,15 @@ async function executeTEE(sessionId: number) {
         verified: false,
         note: "Set OG_PRIVATE_KEY (Ethereum wallet private key funded with OUSDC on chain 10744) to enable real TEE attestation.",
         setup: {
-          step1: "Create an Ethereum wallet (MetaMask or any EVM wallet)",
-          step2: "Fund with OUSDC on OpenGradient Mainnet (chain 10744, RPC: https://rpc.opengradient.ai)",
-          step3: "Export private key → set as OG_PRIVATE_KEY env var",
-          step4: "Optionally set OG_MODEL to choose a different supported model",
+          step1: "Create an Ethereum wallet (MetaMask or any EVM wallet), export the private key",
+          step2: "Add OpenGradient Mainnet: RPC https://rpc.opengradient.ai, Chain ID 10744",
+          step3: "Fund with OUSDC on chain 10744",
+          step4: "Set OG_PRIVATE_KEY env var and restart",
           docs: "https://docs.opengradient.ai/developers/sdk/llm.html",
         },
       };
     } else {
-      const result = await callOpenGradientTEE(session.mergedPrompt, privateKey);
+      const result = await callOpenGradientTEE(session.prompt, privateKey);
       llmResponse = result.response;
       attestation = result.attestation;
     }
