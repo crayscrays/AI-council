@@ -7,9 +7,8 @@ import { z } from "zod";
 import { randomBytes, createHash } from "crypto";
 
 // x402 + viem — handles the full 402 → sign → resubmit flow automatically
-import { wrapFetch } from "@x402/fetch";
-import { ExactEvmScheme } from "@x402/evm/exact/client";
-import { createWalletClient, http as viemHttp } from "viem";
+import { wrapFetchWithPayment, x402Client, x402HTTPClient } from "@x402/fetch";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { privateKeyToAccount } from "viem/accounts";
 
 const TOTAL_VOTERS = 10;
@@ -33,18 +32,8 @@ const MAJORITY = 6; // need ≥6 approvals to execute
 
 const OG_LLM_ENDPOINT = "https://llmogevm.opengradient.ai/v1/chat/completions";
 
-// Base Sepolia — where $OPG testnet tokens live and payments are settled
-const BASE_SEPOLIA_CHAIN = {
-  id: 84532,
-  name: "Base Sepolia",
-  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 as const },
-  rpcUrls: {
-    default: { http: ["https://sepolia.base.org"] as [`https://${string}`] },
-  },
-};
-
-// OpenGradient network identifier used by @x402/evm
-const OG_NETWORK_ID = "eip155:84532"; // Base Sepolia for $OPG testnet payments
+// Network identifier for @x402/evm — Base Sepolia where $OPG testnet tokens live
+const OG_NETWORK_ID = "eip155:84532";
 
 const OG_MODEL = process.env.OG_MODEL || "anthropic/claude-4.0-sonnet";
 const OG_SETTLEMENT = (process.env.OG_SETTLEMENT_MODE || "SETTLE_METADATA") as string;
@@ -61,17 +50,14 @@ function buildX402Fetch(privateKey: string) {
   const key = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
   const account = privateKeyToAccount(key as `0x${string}`);
 
-  const walletClient = createWalletClient({
-    account,
-    chain: BASE_SEPOLIA_CHAIN,
-    transport: viemHttp(),
+  // registerExactEvmScheme takes the viem account directly as the signer
+  // (account has .address + signTypedData + signMessage natively)
+  const client = registerExactEvmScheme(new x402Client(), {
+    signer: account,
+    networks: [OG_NETWORK_ID as any],
   });
-
-  const x402Fetch = wrapFetch(fetch, {
-    schemes: [
-      { network: OG_NETWORK_ID, client: new ExactEvmScheme(walletClient) },
-    ],
-  });
+  const httpClient = new x402HTTPClient(client);
+  const x402Fetch = wrapFetchWithPayment(fetch, httpClient);
 
   return { x402Fetch, walletAddress: account.address };
 }
