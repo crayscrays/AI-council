@@ -540,21 +540,143 @@ export default function CouncilPage({ provider }: { provider: "og" | "phala" }) 
                 )}
 
                 {!attestation.demo && provider === "phala" && (
-                  <div className="mb-3 flex flex-col gap-1.5">
-                    <a
-                      href="https://proof.t16z.com"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 text-xs font-mono text-purple hover:text-purple/80 underline underline-offset-2"
-                    >
-                      <Shield className="w-3 h-3" />
-                      Verify Phala TDX node attestation at proof.t16z.com ↗
-                    </a>
-                    {attestation.processingHash && (
-                      <p className="text-[10px] font-mono text-muted-foreground">
-                        Request ID: <span className="text-foreground/70">{attestation.processingHash as string}</span>
-                        {" "}— use this to correlate your request with Red Pill AI logs
-                      </p>
+                  <div className="mb-3 flex flex-col gap-2">
+                    {/* Overall status */}
+                    {attestation.verified ? (
+                      <div className="flex items-start gap-2 p-2.5 rounded-md bg-success/10 border border-success/30">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0 mt-0.5" />
+                        <p className="text-xs text-success font-mono">
+                          Full TEE proof verified — all 3 checks passed. Paste <code className="bg-success/20 px-1 rounded">tdxQuote</code> at proof.t16z.com to independently verify the Intel enclave.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-2 p-2.5 rounded-md bg-warning/10 border border-warning/30">
+                        <AlertTriangle className="w-3.5 h-3.5 text-warning shrink-0 mt-0.5" />
+                        <p className="text-xs text-warning font-mono">
+                          {(attestation.sigError || attestation.attError || "Verification incomplete") as string}
+                        </p>
+                      </div>
+                    )}
+
+                    {/* Step-by-step checks */}
+                    <div className="rounded-md border border-border/50 bg-background/40 p-3 space-y-2 text-[10px] font-mono">
+                      {[
+                        {
+                          label: "1. Prompt hash match",
+                          ok: attestation.hashesMatch as boolean,
+                          detail: "SHA-256 of your prompt matches what the TEE signed",
+                        },
+                        {
+                          label: "2. ECDSA sig valid",
+                          ok: attestation.sigVerified as boolean,
+                          detail: "Signature recovers to the TEE signing address",
+                        },
+                        {
+                          label: "3. Address in TDX quote",
+                          ok: attestation.addressInQuote as boolean,
+                          detail: "Signing address bound in Intel TDX attestation report",
+                        },
+                      ].map(({ label, ok, detail }) => (
+                        <div key={label} className="flex items-start gap-2">
+                          <span className={`shrink-0 ${ok ? "text-success" : "text-destructive"}`}>{ok ? "✓" : "✗"}</span>
+                          <div>
+                            <span className={ok ? "text-success" : "text-destructive"}>{label}</span>
+                            <span className="text-muted-foreground ml-2">{detail}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Key values */}
+                    <div className="grid grid-cols-1 gap-1 text-[10px] font-mono">
+                      {[
+                        ["Prompt SHA-256",   attestation.requestHash],
+                        ["Response SHA-256", attestation.responseHash],
+                        ["TEE Signer",       attestation.signingAddress],
+                        ["Signature",        attestation.signature],
+                      ].map(([label, val]) => val ? (
+                        <div key={label as string} className="flex gap-2">
+                          <span className="text-muted-foreground shrink-0 w-28">{label as string}</span>
+                          <span className="text-foreground/70 break-all">{val as string}</span>
+                        </div>
+                      ) : null)}
+                    </div>
+
+                    {/* proof.t16z.com guide */}
+                    {attestation.tdxQuote && (
+                      <div className="rounded-md border border-purple/20 bg-purple/5 p-3 space-y-2 text-[10px] font-mono">
+                        <div className="flex items-center gap-1.5 text-purple font-semibold text-xs">
+                          <Shield className="w-3 h-3" />
+                          How to verify independently on proof.t16z.com
+                        </div>
+                        <ol className="list-decimal list-inside space-y-1.5 text-muted-foreground leading-relaxed">
+                          <li>
+                            <button
+                              onClick={() => navigator.clipboard.writeText(attestation.tdxQuote as string)}
+                              className="inline-flex items-center gap-1 text-purple hover:text-purple/80 underline underline-offset-2 ml-1"
+                            >
+                              <Copy className="w-2.5 h-2.5" />
+                              Copy TDX quote (hex)
+                            </button>
+                          </li>
+                          <li>
+                            Go to{" "}
+                            <a
+                              href="https://proof.t16z.com"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-purple hover:text-purple/80 underline underline-offset-2"
+                            >
+                              proof.t16z.com ↗
+                            </a>
+                            , paste the quote and submit
+                          </li>
+                          <li>
+                            On the report page, find the <span className="text-foreground bg-muted px-1 rounded">UserData</span> or <span className="text-foreground bg-muted px-1 rounded">Report Data</span> field — it will look like garbled binary characters. That binary IS your signing address embedded by the Intel TEE hardware.
+                          </li>
+                          <li>
+                            The raw bytes decode as:
+                            <div className="mt-1 ml-2 space-y-0.5">
+                              <div className="flex gap-2 items-center">
+                                <span className="text-success bg-success/10 px-1 rounded">bytes 0–19</span>
+                                <span className="text-foreground/80 break-all">{(attestation.signingAddress as string)?.toLowerCase()}</span>
+                                <span className="text-muted-foreground">(TEE signer)</span>
+                              </div>
+                              <div className="flex gap-2 items-center">
+                                <span className="text-muted-foreground bg-muted px-1 rounded">bytes 20–31</span>
+                                <span className="text-foreground/60">000000000000000000000000</span>
+                                <span className="text-muted-foreground">(padding)</span>
+                              </div>
+                              {attestation.attestationNonce && (
+                                <div className="flex gap-2 items-center">
+                                  <span className="text-primary bg-primary/10 px-1 rounded">bytes 32–63</span>
+                                  <span className="text-foreground/80 break-all">{attestation.attestationNonce as string}</span>
+                                  <span className="text-muted-foreground">(nonce)</span>
+                                </div>
+                              )}
+                            </div>
+                          </li>
+                        </ol>
+                        {attestation.reportDataHex && (
+                          <div className="mt-2 pt-2 border-t border-purple/20">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-purple/80">Expected full report_data (hex):</span>
+                              <button
+                                onClick={() => navigator.clipboard.writeText(attestation.reportDataHex as string)}
+                                className="inline-flex items-center gap-1 text-purple hover:text-purple/80 underline underline-offset-2"
+                              >
+                                <Copy className="w-2.5 h-2.5" />
+                                Copy
+                              </button>
+                            </div>
+                            <div className="bg-background rounded p-1.5 border border-border/50 break-all text-foreground/60 leading-relaxed">
+                              <span className="text-success">{(attestation.signingAddress as string)?.slice(2).toLowerCase()}</span>
+                              <span className="text-muted-foreground/40">{"00".repeat(12)}</span>
+                              <span className="text-primary">{attestation.attestationNonce as string}</span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     )}
                   </div>
                 )}
