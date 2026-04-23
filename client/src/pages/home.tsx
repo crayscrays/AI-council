@@ -508,7 +508,7 @@ export default function HomePage() {
                   <div className="flex items-start gap-2 mb-3 p-2.5 rounded-md bg-warning/10 border border-warning/30">
                     <AlertTriangle className="w-3.5 h-3.5 text-warning shrink-0 mt-0.5" />
                     <p className="text-xs text-warning font-mono">
-                      Demo mode: Set <code className="bg-warning/20 px-1 rounded">OG_PRIVATE_KEY</code> (Ethereum wallet funded with OUSDC on chain 10744) to enable live TEE execution on OpenGradient.
+                      Demo mode: Set <code className="bg-warning/20 px-1 rounded">OG_PRIVATE_KEY</code> to enable live TEE. Get free <code className="bg-warning/20 px-1 rounded">$OPG</code> testnet tokens at{" "}<a href="https://faucet.opengradient.ai" target="_blank" rel="noopener noreferrer" className="underline">faucet.opengradient.ai</a>.
                     </p>
                   </div>
                 )}
@@ -563,7 +563,7 @@ export default function HomePage() {
             <a href="https://opengradient.ai" target="_blank" rel="noopener noreferrer" className="text-primary/60 hover:text-primary transition-colors">
               OpenGradient
             </a>
-            {" "}TEE
+            {" "}Testnet TEE · Base Sepolia $OPG
           </p>
           <p className="text-xs font-mono text-muted-foreground/40">
             Session #{session.id}

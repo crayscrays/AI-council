@@ -5,155 +5,162 @@ import { sessions as sessionsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { randomBytes, createHash } from "crypto";
-import { ethers } from "ethers";
+
+// x402 + viem — handles the full 402 → sign → resubmit flow automatically
+import { wrapFetch } from "@x402/fetch";
+import { ExactEvmScheme } from "@x402/evm/exact/client";
+import { createWalletClient, http as viemHttp } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 
 const TOTAL_VOTERS = 10;
 const MAJORITY = 6; // need ≥6 approvals to execute
 
-// OpenGradient x402 config
+// ── Testnet config ────────────────────────────────────────────────────────────
+//
+//  OpenGradient Testnet (primary):
+//    RPC  : https://ogevmdevnet.opengradient.ai
+//    Chain: 10740
+//    Token: OPG
+//
+//  Payment is handled via Base Sepolia (chain 84532) with $OPG token:
+//    Token contract: 0x240b09731D96979f50B2C649C9CE10FcF9C7987F
+//    Faucet        : https://faucet.opengradient.ai
+//
+//  LLM endpoint (same for testnet and mainnet — payments routed by chain):
+//    https://llmogevm.opengradient.ai/v1/chat/completions
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
 const OG_LLM_ENDPOINT = "https://llmogevm.opengradient.ai/v1/chat/completions";
+
+// Base Sepolia — where $OPG testnet tokens live and payments are settled
+const BASE_SEPOLIA_CHAIN = {
+  id: 84532,
+  name: "Base Sepolia",
+  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 as const },
+  rpcUrls: {
+    default: { http: ["https://sepolia.base.org"] as [`https://${string}`] },
+  },
+};
+
+// OpenGradient network identifier used by @x402/evm
+const OG_NETWORK_ID = "eip155:84532"; // Base Sepolia for $OPG testnet payments
+
 const OG_MODEL = process.env.OG_MODEL || "anthropic/claude-4.0-sonnet";
+const OG_SETTLEMENT = (process.env.OG_SETTLEMENT_MODE || "SETTLE_METADATA") as string;
 
 /**
- * Call OpenGradient's x402 TEE LLM endpoint.
- * Flow:
- *  1. POST → 402 with X-PAYMENT-REQUIRED header
- *  2. Wallet signs payment payload
- *  3. Re-POST with X-PAYMENT-SIGNATURE → LLM response + on-chain settlement
+ * Build an x402-wrapped fetch client for a given private key.
+ * The @x402/fetch library handles the full 402 challenge-response automatically:
+ *   1. Initial POST → server returns 402 + X-PAYMENT-REQUIRED header
+ *   2. Library signs payment with wallet
+ *   3. Library retries with X-PAYMENT header
+ *   4. Returns final response
+ */
+function buildX402Fetch(privateKey: string) {
+  const key = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+  const account = privateKeyToAccount(key as `0x${string}`);
+
+  const walletClient = createWalletClient({
+    account,
+    chain: BASE_SEPOLIA_CHAIN,
+    transport: viemHttp(),
+  });
+
+  const x402Fetch = wrapFetch(fetch, {
+    schemes: [
+      { network: OG_NETWORK_ID, client: new ExactEvmScheme(walletClient) },
+    ],
+  });
+
+  return { x402Fetch, walletAddress: account.address };
+}
+
+/**
+ * Call OpenGradient TEE LLM via x402.
+ * Payment in $OPG on Base Sepolia, proof settled on OpenGradient Testnet.
  */
 async function callOpenGradientTEE(
   prompt: string,
   privateKey: string
-): Promise<{ response: string; paymentHash: string; txHash: string; attestation: object }> {
-  const wallet = new ethers.Wallet(privateKey);
+): Promise<{ response: string; txHash: string; attestation: object }> {
+  const { x402Fetch, walletAddress } = buildX402Fetch(privateKey);
 
-  const body = JSON.stringify({
-    model: OG_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a helpful AI assistant running inside a Trusted Execution Environment (TEE) on OpenGradient's decentralized network. Your responses are cryptographically verified and settled on-chain.",
-      },
-      { role: "user", content: prompt },
-    ],
-    max_tokens: 1024,
-    temperature: 0.7,
-    settlement_mode: process.env.OG_SETTLEMENT_MODE || "SETTLE_METADATA",
-    inference_mode: "TEE",
-  });
-
-  // Step 1: Initial request — expect 402
-  const firstRes = await fetch(OG_LLM_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body,
-  });
-
-  if (firstRes.status !== 402) {
-    if (!firstRes.ok) {
-      const err = await firstRes.text();
-      throw new Error(`OpenGradient API error: ${firstRes.status} — ${err}`);
-    }
-    const data = await firstRes.json() as any;
-    return {
-      response: data.choices?.[0]?.message?.content ?? "(No response)",
-      paymentHash: "n/a",
-      txHash: "n/a",
-      attestation: { note: "Responded without payment challenge", raw: data },
-    };
-  }
-
-  // Step 2: Parse payment requirement
-  const paymentRequiredHeader =
-    firstRes.headers.get("X-PAYMENT-REQUIRED") ||
-    firstRes.headers.get("PAYMENT-REQUIRED");
-
-  if (!paymentRequiredHeader) {
-    throw new Error("OpenGradient returned 402 but no X-PAYMENT-REQUIRED header");
-  }
-
-  let paymentRequired: any;
-  try {
-    try {
-      paymentRequired = JSON.parse(paymentRequiredHeader);
-    } catch {
-      paymentRequired = JSON.parse(Buffer.from(paymentRequiredHeader, "base64").toString());
-    }
-  } catch {
-    throw new Error(`Failed to parse X-PAYMENT-REQUIRED header: ${paymentRequiredHeader.slice(0, 200)}`);
-  }
-
-  // Step 3: Sign payment payload
-  const paymentPayload = {
-    ...paymentRequired,
-    timestamp: Date.now(),
-    nonce: randomBytes(16).toString("hex"),
-  };
-  const signature = await wallet.signMessage(JSON.stringify(paymentPayload));
-  const paymentSignature = JSON.stringify({
-    payload: paymentPayload,
-    signature,
-    address: wallet.address,
-  });
-
-  // Step 4: Re-submit with payment signature
-  const secondRes = await fetch(OG_LLM_ENDPOINT, {
+  const res = await x402Fetch(OG_LLM_ENDPOINT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-PAYMENT-SIGNATURE": paymentSignature,
-      "PAYMENT-SIGNATURE": paymentSignature,
+      "X-SETTLE": OG_SETTLEMENT,    // settlement mode header
     },
-    body,
+    body: JSON.stringify({
+      model: OG_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a helpful AI assistant running inside a Trusted Execution Environment (TEE) on OpenGradient's decentralized network. Your responses are cryptographically verified and settled on-chain.",
+        },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: 1024,
+      temperature: 0.7,
+    }),
   });
 
-  if (!secondRes.ok) {
-    const err = await secondRes.text();
-    throw new Error(`OpenGradient payment/inference error: ${secondRes.status} — ${err}`);
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`OpenGradient TEE error: ${res.status} — ${err.slice(0, 400)}`);
   }
 
-  const result = await secondRes.json() as any;
+  const data = await res.json() as any;
 
-  const paymentResponse =
-    secondRes.headers.get("X-PAYMENT-RESPONSE") ||
-    secondRes.headers.get("PAYMENT-RESPONSE");
+  // Extract settlement/payment info from response headers
+  const paymentResponseHeader =
+    res.headers.get("X-PAYMENT-RESPONSE") ||
+    res.headers.get("PAYMENT-RESPONSE") ||
+    res.headers.get("x-payment-response");
 
-  let txHash = "pending";
-  let paymentHash = "pending";
-  if (paymentResponse) {
+  let txHash = "pending-settlement";
+  let paymentId = "";
+
+  if (paymentResponseHeader) {
     try {
-      const pr = JSON.parse(paymentResponse);
-      txHash = pr.tx_hash ?? pr.txHash ?? "pending";
-      paymentHash = pr.payment_id ?? pr.paymentId ?? "pending";
-    } catch {}
+      const pr = JSON.parse(paymentResponseHeader);
+      txHash = pr.tx_hash ?? pr.txHash ?? pr.transaction ?? "pending-settlement";
+      paymentId = pr.payment_id ?? pr.paymentId ?? "";
+    } catch {
+      // header may not be JSON — keep defaults
+    }
   }
 
   const llmContent =
-    result.choices?.[0]?.message?.content ??
-    result.completion ??
+    data.choices?.[0]?.message?.content ??
+    data.completion ??
     "(No response)";
 
   const attestation = {
-    provider: "OpenGradient",
+    provider: "OpenGradient Testnet",
     model: OG_MODEL,
-    settlementMode: process.env.OG_SETTLEMENT_MODE || "SETTLE_METADATA",
+    settlementMode: OG_SETTLEMENT,
     inferenceMode: "TEE",
     teeType: "Intel TDX (hardware-attested)",
-    network: "OpenGradient Mainnet (chain 10744)",
-    walletAddress: wallet.address,
+    paymentNetwork: "Base Sepolia (chain 84532)",
+    settlementNetwork: "OpenGradient Testnet (chain 10740)",
+    token: "$OPG (0x240b09731D96979f50B2C649C9CE10FcF9C7987F)",
+    walletAddress,
     txHash,
-    paymentHash,
-    blockExplorer: txHash !== "pending"
+    paymentId,
+    blockExplorer: txHash !== "pending-settlement"
       ? `https://explorer.opengradient.ai/tx/${txHash}`
       : "https://explorer.opengradient.ai",
     timestamp: new Date().toISOString(),
     verified: true,
-    note: "Prompt routed through Intel TDX TEE node to Anthropic. TEE attestation proof posted and verified on OpenGradient blockchain by 2/3+ validators.",
-    verification: result.verification ?? null,
+    note:
+      "Prompt routed through Intel TDX TEE node. Payment settled in $OPG on Base Sepolia. TEE attestation proof verified on OpenGradient Testnet by 2/3+ validators.",
+    verification: data.verification ?? null,
   };
 
-  return { response: llmContent, paymentHash, txHash, attestation };
+  return { response: llmContent, txHash, attestation };
 }
 
 export function registerRoutes(httpServer: Server, app: Express) {
@@ -162,11 +169,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
     let session = storage.getActiveSession() ?? storage.getLatestSession();
     if (!session) session = storage.createSession();
     const votes = storage.getVotesForSession(session.id);
-    const attestation = session.attestationReport ? JSON.parse(session.attestationReport) : null;
+    const attestation = session.attestationReport
+      ? JSON.parse(session.attestationReport)
+      : null;
     res.json({ session, votes, attestation });
   });
 
-  // POST /api/session/:id/prompt — submit the single prompt (moves to voting)
+  // POST /api/session/:id/prompt — submit the single prompt → moves to voting
   app.post("/api/session/:id/prompt", async (req, res) => {
     const sessionId = parseInt(req.params.id);
     const schema = z.object({
@@ -240,24 +249,34 @@ export function registerRoutes(httpServer: Server, app: Express) {
       executeTEE(sessionId).catch(console.error);
     }
 
-    // Impossible to reach majority → reset to drafting
+    // Cannot reach majority → reset to drafting
     if (rejectCount > TOTAL_VOTERS - MAJORITY) {
-      storage.updateSession(sessionId, { status: "drafting", prompt: null, mergedPrompt: null });
+      storage.updateSession(sessionId, {
+        status: "drafting",
+        prompt: null,
+        mergedPrompt: null,
+      });
     }
 
     res.json({ vote, approveCount, rejectCount });
   });
 
-  // GET /api/session/:id/result — poll for result
+  // GET /api/session/:id/result — poll for TEE result
   app.get("/api/session/:id/result", (req, res) => {
     const sessionId = parseInt(req.params.id);
-    const session = db.select().from(sessionsTable).where(eq(sessionsTable.id, sessionId)).get();
+    const session = db
+      .select()
+      .from(sessionsTable)
+      .where(eq(sessionsTable.id, sessionId))
+      .get();
     if (!session) return res.status(404).json({ error: "Session not found" });
     const sessionVotes = storage.getVotesForSession(sessionId);
     res.json({
       session,
       votes: sessionVotes,
-      attestation: session.attestationReport ? JSON.parse(session.attestationReport) : null,
+      attestation: session.attestationReport
+        ? JSON.parse(session.attestationReport)
+        : null,
     });
   });
 
@@ -270,7 +289,11 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
 async function executeTEE(sessionId: number) {
   try {
-    const session = db.select().from(sessionsTable).where(eq(sessionsTable.id, sessionId)).get();
+    const session = db
+      .select()
+      .from(sessionsTable)
+      .where(eq(sessionsTable.id, sessionId))
+      .get();
     if (!session?.prompt) throw new Error("No prompt found");
 
     const privateKey = process.env.OG_PRIVATE_KEY || "";
@@ -281,38 +304,45 @@ async function executeTEE(sessionId: number) {
     let attestation: object;
 
     if (!privateKey) {
-      // Demo mode
+      // ── Demo mode ─────────────────────────────────────────────────────────
       llmResponse = [
         "[DEMO MODE — OG_PRIVATE_KEY not set]\n",
-        "In production, this prompt is sent to OpenGradient's decentralized TEE network.",
+        "In production, this prompt is sent to OpenGradient's decentralised TEE network.",
         `Model: ${OG_MODEL}`,
-        "Routed through an Intel TDX TEE node, cryptographically attested,",
-        "and the proof is settled on the OpenGradient blockchain (chain 10744).\n",
+        "Routed through an Intel TDX TEE node with cryptographic attestation.",
+        "Payment settled in $OPG on Base Sepolia (chain 84532).",
+        "Proof verified on OpenGradient Testnet (chain 10740).\n",
         `Prompt SHA-256: ${promptHash}\n`,
-        "Set OG_PRIVATE_KEY to enable live execution.",
+        "To enable live execution:",
+        "  1. Create an EVM wallet and export the private key",
+        "  2. Get free $OPG tokens from https://faucet.opengradient.ai",
+        "  3. Set OG_PRIVATE_KEY=<your-key> and restart the server",
       ].join("\n");
 
       attestation = {
         demo: true,
-        provider: "OpenGradient (demo)",
+        provider: "OpenGradient Testnet (demo)",
         model: OG_MODEL,
         inferenceMode: "TEE",
-        teeType: "Intel TDX (hardware-attested) — NOT verified in demo",
-        network: "OpenGradient Mainnet (chain 10744)",
+        teeType: "Intel TDX — NOT verified in demo",
+        paymentNetwork: "Base Sepolia (chain 84532)",
+        settlementNetwork: "OpenGradient Testnet (chain 10740)",
+        token: "$OPG (0x240b09731D96979f50B2C649C9CE10FcF9C7987F)",
         nonce,
         promptHash,
         timestamp: new Date().toISOString(),
         verified: false,
-        note: "Set OG_PRIVATE_KEY (Ethereum wallet private key funded with OUSDC on chain 10744) to enable real TEE attestation.",
         setup: {
-          step1: "Create an Ethereum wallet (MetaMask or any EVM wallet), export the private key",
-          step2: "Add OpenGradient Mainnet: RPC https://rpc.opengradient.ai, Chain ID 10744",
-          step3: "Fund with OUSDC on chain 10744",
-          step4: "Set OG_PRIVATE_KEY env var and restart",
+          step1: "Create any EVM wallet (MetaMask, Rabby, cast wallet new, etc.)",
+          step2: "Get free $OPG testnet tokens → https://faucet.opengradient.ai",
+          step3: "Export private key → set as OG_PRIVATE_KEY env var",
+          step4: "Optionally set OG_MODEL to change the LLM (default: anthropic/claude-4.0-sonnet)",
+          faucet: "https://faucet.opengradient.ai",
           docs: "https://docs.opengradient.ai/developers/sdk/llm.html",
         },
       };
     } else {
+      // ── Live TEE execution ────────────────────────────────────────────────
       const result = await callOpenGradientTEE(session.prompt, privateKey);
       llmResponse = result.response;
       attestation = result.attestation;
@@ -330,7 +360,10 @@ async function executeTEE(sessionId: number) {
     storage.updateSession(sessionId, {
       status: "complete",
       llmResponse: `Execution failed: ${err instanceof Error ? err.message : String(err)}`,
-      attestationReport: JSON.stringify({ error: String(err) }),
+      attestationReport: JSON.stringify({
+        error: String(err),
+        timestamp: new Date().toISOString(),
+      }),
       completedAt: Date.now(),
     });
   }

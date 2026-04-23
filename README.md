@@ -1,22 +1,27 @@
 # AI Council — Consensus Prompt Engine
 
-A 10-user consensus prompt engine powered by [OpenGradient](https://opengradient.ai) Trusted Execution Environment (TEE) with on-chain cryptographic proof settlement.
+A single-prompt consensus engine: one prompt, council vote (6/10 majority), then verifiable AI execution inside a Trusted Execution Environment on **OpenGradient Testnet**.
 
-## How It Works
+## Flow
 
-1. **Input** — 10 users each submit their own prompt contribution
-2. **Review** — All inputs are merged into a single consensus prompt
-3. **Vote** — Each user votes Approve or Reject; requires 6/10 (majority) to proceed
-4. **Execute** — The approved prompt is sent to OpenGradient's decentralized TEE network via the x402 payment-gated API, routed through an Intel TDX node to the LLM provider
-5. **Result** — The LLM response is returned alongside a cryptographic attestation proof that is permanently settled on the OpenGradient blockchain
+```
+Prompt → Vote (6/10 majority) → TEE Execute → Result + On-Chain Proof
+```
+
+1. **Prompt** — anyone writes the prompt (up to 5,000 chars)
+2. **Vote** — 10 council members (Alice–Jack) vote Approve/Reject. Need 6+ to proceed
+3. **Execute** — prompt sent to OpenGradient TEE via x402 payment-gated API
+4. **Result** — LLM response + cryptographic attestation proof settled on-chain
 
 ## Stack
 
 - **Frontend**: React + Vite + Tailwind CSS + shadcn/ui
 - **Backend**: Express + SQLite (Drizzle ORM)
-- **TEE**: [OpenGradient](https://opengradient.ai) x402 LLM inference (Intel TDX hardware-attested)
-- **Default model**: `anthropic/claude-4.0-sonnet` (configurable via `OG_MODEL`)
-- **Proof settlement**: OpenGradient blockchain (chain 10744), verified by 2/3+ validators
+- **TEE**: [OpenGradient Testnet](https://docs.opengradient.ai) x402 LLM inference (Intel TDX)
+- **Payment**: `$OPG` token on Base Sepolia (chain 84532) — **free testnet tokens available**
+- **Proof settlement**: OpenGradient Testnet (chain 10740), verified by 2/3+ validators
+- **Default model**: `anthropic/claude-4.0-sonnet` (configurable)
+- **Payment library**: [`@x402/fetch`](https://github.com/coinbase/x402) — handles 402 challenge-response automatically
 
 ## Getting Started
 
@@ -25,53 +30,54 @@ npm install
 npm run dev
 ```
 
-The app runs on `http://localhost:5000`.
+App runs on `http://localhost:5000`. Works in **demo mode** with no wallet needed.
 
-By default it runs in **demo mode** with a simulated response and attestation structure — no wallet needed.
-
-## Live TEE Execution (OpenGradient)
-
-To enable real on-chain TEE inference you need an Ethereum wallet funded with **OUSDC** on the OpenGradient network.
+## Live TEE on Testnet (Free)
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `OG_PRIVATE_KEY` | **Yes** | Ethereum wallet private key (hex, with or without `0x` prefix) used to sign x402 payments |
-| `OG_MODEL` | No | OpenGradient model to use (default: `anthropic/claude-4.0-sonnet`) |
-| `OG_SETTLEMENT_MODE` | No | On-chain settlement mode (default: `SETTLE_METADATA`) |
+| `OG_PRIVATE_KEY` | **Yes** | Ethereum wallet private key (hex, with or without `0x`) |
+| `OG_MODEL` | No | LLM model ID (default: `anthropic/claude-4.0-sonnet`) |
+| `OG_SETTLEMENT_MODE` | No | `SETTLE_METADATA` \| `SETTLE` \| `SETTLE_BATCH` (default: `SETTLE_METADATA`) |
 
-### Wallet Setup (Step by Step)
+### Testnet Setup (3 steps, free)
 
-1. **Create an Ethereum wallet** — use MetaMask, Rabby, or any EVM-compatible wallet. Export the private key.
+**1. Create a wallet**
 
-2. **Add OpenGradient Mainnet to your wallet**:
-   - Network name: `OpenGradient`
-   - RPC URL: `https://rpc.opengradient.ai`
-   - Chain ID: `10744`
-   - Currency symbol: `OG`
+Any EVM-compatible wallet works. Quickest options:
+- MetaMask → create new account → export private key
+- CLI: `npx @scure/bip39 generate` or `cast wallet new` (Foundry)
+- Or generate one in Node: `node -e "const {ethers}=require('ethers'); console.log(ethers.Wallet.createRandom().privateKey)"`
 
-3. **Get OUSDC** (the payment token for LLM inference on OpenGradient mainnet):
-   - Bridge or swap into OUSDC on chain 10744
-   - OUSDC contract: check [docs.opengradient.ai](https://docs.opengradient.ai)
-   - Alternatively use Base Sepolia testnet with `$OPG` test tokens from the faucet (see below)
+**2. Get free $OPG testnet tokens**
 
-4. **Set the env var and run**:
-   ```bash
-   OG_PRIVATE_KEY=0xyourprivatekeyhere npm run dev
-   ```
+Visit **[faucet.opengradient.ai](https://faucet.opengradient.ai)** — enter your wallet address, receive 0.1 OPG per request. No signup needed.
 
-### Testnet (Free) Option
+Token: `$OPG` at `0x240b09731D96979f50B2C649C9CE10FcF9C7987F` on Base Sepolia (chain 84532).
 
-OpenGradient also supports Base Sepolia testnet with free `$OPG` test tokens:
+**3. Run the app**
 
-1. Create a wallet
-2. Visit the [OpenGradient SDK faucet](https://docs.opengradient.ai/developers/sdk/) to get test tokens
-3. Run `opengradient config init` (Python SDK) to set up your account
+```bash
+OG_PRIVATE_KEY=0xyourprivatekeyhere npm run dev
+```
 
-> Note: The testnet uses a different endpoint and chain. The code defaults to mainnet (chain 10744). Ask the team for testnet endpoint details.
+That's it. The [`@x402/fetch`](https://github.com/coinbase/x402) library automatically handles the x402 payment flow:
+- Initial request → server returns `402 Payment Required`
+- Library signs the payment with your wallet
+- Library retries → inference executes in TEE → proof settled on-chain
 
-### Supported Models (TEE mode)
+### Network Details
+
+| Network | Purpose | Chain ID | RPC |
+|---|---|---|---|
+| Base Sepolia | Payment settlement ($OPG tokens) | 84532 | `https://sepolia.base.org` |
+| OpenGradient Testnet | Proof settlement + block explorer | 10740 | `https://ogevmdevnet.opengradient.ai` |
+
+Block explorer: [explorer.opengradient.ai](https://explorer.opengradient.ai)
+
+### Supported Models (TEE)
 
 | Model | Provider |
 |---|---|
@@ -84,44 +90,39 @@ OpenGradient also supports Base Sepolia testnet with free `$OPG` test tokens:
 | `x-ai/grok-3-beta` | xAI |
 | `x-ai/grok-4-1-fast-non-reasoning` | xAI |
 
-All models route through Intel TDX TEE nodes — the gateway is hardware-attested even though inference runs at the provider.
-
-## Settlement Modes
+### Settlement Modes
 
 | Mode | On-Chain Data | Use Case |
 |---|---|---|
-| `SETTLE_METADATA` | Full prompt + full response + all metadata | Maximum auditability — anyone can verify exactly what was sent and received |
-| `SETTLE` | Input/output hashes only | Privacy-preserving — proves execution without exposing content |
-| `SETTLE_BATCH` | Aggregated batch hashes | High-volume / cost-efficient |
-
-Default is `SETTLE_METADATA` so the consensus prompt and LLM response are permanently on-chain.
-
-## Attestation Report Fields
-
-| Field | Description |
-|---|---|
-| `provider` | `OpenGradient` |
-| `model` | Model used for inference |
-| `inferenceMode` | `TEE` — hardware-attested routing |
-| `teeType` | `Intel TDX (hardware-attested)` |
-| `network` | OpenGradient Mainnet (chain 10744) |
-| `txHash` | On-chain settlement transaction hash |
-| `blockExplorer` | Link to verify proof on OpenGradient explorer |
-| `walletAddress` | Wallet that signed the x402 payment |
-| `settlementMode` | How much data was recorded on-chain |
-| `verified` | `true` when real TEE executed; `false` in demo mode |
-| `timestamp` | ISO timestamp of execution |
+| `SETTLE_METADATA` | Full prompt + response + metadata | Maximum auditability (default) |
+| `SETTLE` | Input/output hashes only | Privacy-preserving |
+| `SETTLE_BATCH` | Batch hashes | High-volume / lower cost |
 
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/session` | Get or create active session |
-| `POST` | `/api/session/:id/input` | Submit a user input |
-| `POST` | `/api/session/:id/lock` | Lock inputs and move to voting |
-| `POST` | `/api/session/:id/vote` | Cast a vote (approve/reject) |
-| `GET` | `/api/session/:id/result` | Poll for TEE execution result |
-| `POST` | `/api/session/new` | Start a new session |
+| `POST` | `/api/session/:id/prompt` | Submit prompt → moves to voting |
+| `POST` | `/api/session/:id/vote` | Cast approve/reject vote |
+| `GET` | `/api/session/:id/result` | Poll for TEE result |
+| `POST` | `/api/session/new` | Start a new round |
+
+## Attestation Fields
+
+| Field | Description |
+|---|---|
+| `provider` | `OpenGradient Testnet` |
+| `model` | LLM model used |
+| `inferenceMode` | `TEE` — hardware-attested |
+| `teeType` | `Intel TDX (hardware-attested)` |
+| `paymentNetwork` | Base Sepolia (chain 84532) |
+| `settlementNetwork` | OpenGradient Testnet (chain 10740) |
+| `token` | `$OPG` contract address |
+| `walletAddress` | Wallet that signed the payment |
+| `txHash` | On-chain settlement transaction |
+| `blockExplorer` | Link to verify proof |
+| `verified` | `true` for live TEE; `false` in demo |
 
 ## Build
 
@@ -132,7 +133,8 @@ NODE_ENV=production node dist/index.cjs
 
 ## References
 
-- [OpenGradient Docs — LLM Execution](https://docs.opengradient.ai/learn/onchain_inference/llm_execution.html)
-- [OpenGradient SDK](https://docs.opengradient.ai/developers/sdk/llm.html)
-- [OpenGradient Block Explorer](https://explorer.opengradient.ai)
-- [x402 Payment Protocol](https://x402.org)
+- [OpenGradient Testnet Deployments](https://docs.opengradient.ai/learn/network/deployment.html)
+- [OpenGradient x402 LLM Docs](https://docs.opengradient.ai/developers/sdk/llm.html)
+- [x402 Protocol (Coinbase)](https://github.com/coinbase/x402)
+- [$OPG Faucet](https://faucet.opengradient.ai)
+- [Block Explorer](https://explorer.opengradient.ai)
