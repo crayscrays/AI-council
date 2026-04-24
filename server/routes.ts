@@ -6,10 +6,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { randomBytes, createHash } from "crypto";
 import { spawn } from "child_process";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { join } from "path";
 
 const TOTAL_VOTERS = 1;
 const MAJORITY = 1; // need ≥1 approval to execute
@@ -21,7 +18,7 @@ async function callOpenGradientTEE(
   privateKey: string
 ): Promise<{ response: string; txHash: string; attestation: object }> {
   return new Promise((resolve, reject) => {
-    const scriptPath = join(__dirname, "og_llm.py");
+    const scriptPath = join(process.cwd(), "server", "og_llm.py");
     const child = spawn("python3", [scriptPath], {
       env: { ...process.env, OG_PRIVATE_KEY: privateKey, OG_MODEL },
     });
