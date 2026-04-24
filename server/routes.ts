@@ -5,165 +5,79 @@ import { sessions as sessionsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { randomBytes, createHash } from "crypto";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
-import { createPublicClient, http as viemHttp } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
-import { wrapFetchWithPayment, x402Client, x402HTTPClient } from "@x402/fetch";
-import { UptoEvmScheme } from "@x402/evm/upto/client";
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const TOTAL_VOTERS = 1;
 const MAJORITY = 1; // need ≥1 approval to execute
 
-// OpenGradient devnet — TEE registry lives here
-const OG_DEVNET_RPC = "https://ogevmdevnet.opengradient.ai";
-const OG_TEE_REGISTRY = "0x4e72238852f3c918f4E4e57AeC9280dDB0c80248" as const;
-// x402 payments on Base mainnet
-const BASE_MAINNET_NETWORK = "eip155:8453";
-const BASE_MAINNET_RPC = "https://base-rpc.publicnode.com";
-
-const OG_MODEL = process.env.OG_MODEL || "google/gemini-2.5-flash";
-
-const OG_DEVNET_CHAIN = {
-  id: 10740,
-  name: "OpenGradient Devnet",
-  nativeCurrency: { name: "OPG", symbol: "OPG", decimals: 18 },
-  rpcUrls: { default: { http: [OG_DEVNET_RPC] } },
-} as const;
-
-const TEE_REGISTRY_ABI = [
-  {
-    inputs: [{ name: "teeType", type: "uint8" }],
-    name: "getActiveTEEs",
-    outputs: [
-      {
-        components: [
-          { name: "owner", type: "address" },
-          { name: "paymentAddress", type: "address" },
-          { name: "endpoint", type: "string" },
-          { name: "publicKey", type: "bytes" },
-          { name: "tlsCertificate", type: "bytes" },
-          { name: "pcrHash", type: "bytes32" },
-          { name: "teeType", type: "uint8" },
-          { name: "enabled", type: "bool" },
-          { name: "registeredAt", type: "uint256" },
-          { name: "lastHeartbeatAt", type: "uint256" },
-        ],
-        type: "tuple[]",
-      },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-] as const;
-
-// Cache TEE endpoint for 5 minutes
-let teeCache: { endpoint: string; expiry: number } | null = null;
-
-async function getActiveTEEEndpoint(): Promise<string> {
-  if (teeCache && teeCache.expiry > Date.now()) return teeCache.endpoint;
-
-  const client = createPublicClient({
-    chain: OG_DEVNET_CHAIN as any,
-    transport: viemHttp(OG_DEVNET_RPC),
-  });
-
-  const tees = await client.readContract({
-    address: OG_TEE_REGISTRY,
-    abi: TEE_REGISTRY_ABI,
-    functionName: "getActiveTEEs",
-    args: [0],
-  });
-
-  if (!tees || tees.length === 0) throw new Error("No active TEE nodes found in registry");
-
-  const tee = (tees as any[])[Math.floor(Math.random() * tees.length)];
-  teeCache = { endpoint: tee.endpoint, expiry: Date.now() + 5 * 60 * 1000 };
-  return tee.endpoint;
-}
+const OG_MODEL = process.env.OG_MODEL || "anthropic/claude-opus-4-6";
 
 async function callOpenGradientTEE(
   prompt: string,
   privateKey: string
 ): Promise<{ response: string; txHash: string; attestation: object }> {
-  const teeEndpoint = await getActiveTEEEndpoint();
-
-  const key = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
-  const account = privateKeyToAccount(key as `0x${string}`);
-
-  const client = new x402Client();
-  const uptoScheme = new UptoEvmScheme(account as any, { rpcUrl: BASE_MAINNET_RPC });
-  client.register(BASE_MAINNET_NETWORK as any, uptoScheme);
-  const httpClient = new x402HTTPClient(client);
-  const x402Fetch = wrapFetchWithPayment(fetch, httpClient);
-
-  // TEE nodes use self-signed TLS certs — disable verification for this call only
-  const prevTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
-  let res: Response;
-  try {
-    res = await x402Fetch(`${teeEndpoint}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer 0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        "X-SETTLEMENT-TYPE": "individual",
-      },
-      body: JSON.stringify({
-        model: OG_MODEL,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a helpful AI assistant running inside a Trusted Execution Environment (TEE) on OpenGradient's decentralized network. Your responses are cryptographically verified and settled on-chain.",
-          },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 1024,
-        temperature: 0.7,
-      }),
+  return new Promise((resolve, reject) => {
+    const scriptPath = join(__dirname, "og_llm.py");
+    const child = spawn("python3", [scriptPath], {
+      env: { ...process.env, OG_PRIVATE_KEY: privateKey, OG_MODEL },
     });
-  } finally {
-    if (prevTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls;
-  }
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenGradient TEE error: ${res.status} — ${err.slice(0, 400)}`);
-  }
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.on("error", (err) => reject(new Error(`Failed to spawn og_llm.py: ${err.message}`)));
+    child.stdin.write(prompt);
+    child.stdin.end();
 
-  const data = await res.json() as any;
+    child.on("close", (code: number) => {
+      if (code !== 0) {
+        return reject(new Error(`og_llm.py exited ${code}: ${stderr.slice(0, 400)}`));
+      }
+      let result: any;
+      try {
+        result = JSON.parse(stdout);
+      } catch {
+        return reject(new Error(`Failed to parse og_llm.py output: ${stdout.slice(0, 400)}`));
+      }
+      if (result.error) return reject(new Error(`og_llm.py: ${result.error}`));
 
-  const paymentHeader = res.headers.get("x-payment-response") || res.headers.get("X-PAYMENT-RESPONSE");
-  let txHash = "pending-settlement";
-  if (paymentHeader) {
-    try {
-      const pr = JSON.parse(paymentHeader);
-      txHash = pr.tx_hash ?? pr.txHash ?? "pending-settlement";
-    } catch { /* keep default */ }
-  }
+      const teePaymentAddress = result.tee_payment_address ?? null;
+      const teeId = result.tee_id ?? null;
+      const processingHash = result.processing_hash ?? null;
+      const attestation = {
+        provider: "OpenGradient TEE",
+        model: result.model ?? OG_MODEL,
+        inferenceMode: "TEE",
+        teeType: "Intel TDX (hardware-attested)",
+        teeEndpoint: result.tee_endpoint ?? "via on-chain registry",
+        teeId,
+        teePaymentAddress,
+        processingHash,
+        // x-processing-hash from the TEE response links to the exact on-chain settlement record
+        txProofUrl: processingHash
+          ? `https://explorer.opengradient.ai/tx/${processingHash}`
+          : null,
+        // Fallback: TEE node's registered identity on OG devnet
+        teeRegistryUrl: teePaymentAddress
+          ? `https://explorer.opengradient.ai/address/${teePaymentAddress}`
+          : null,
+        teeSignature: result.tee_signature ?? null,
+        teeTimestamp: result.tee_timestamp ?? null,
+        timestamp: new Date().toISOString(),
+        verified: !!(result.tee_signature),
+        note: processingHash
+          ? "txProofUrl links to the exact on-chain inference record (input + output + signature) settled via INDIVIDUAL_FULL mode."
+          : "teeSignature is an RSA-PSS signature over the response produced inside the Intel TDX enclave. teeRegistryUrl shows the TEE node's on-chain identity.",
+      };
 
-  const llmContent = data.choices?.[0]?.message?.content ?? data.completion ?? "(No response)";
-
-  const attestation = {
-    provider: "OpenGradient TEE",
-    model: OG_MODEL,
-    inferenceMode: "TEE",
-    teeType: "Intel TDX (hardware-attested)",
-    teeEndpoint,
-    walletAddress: account.address,
-    txHash,
-    blockExplorer:
-      txHash !== "pending-settlement"
-        ? `https://explorer.opengradient.ai/tx/${txHash}`
-        : "https://explorer.opengradient.ai",
-    timestamp: new Date().toISOString(),
-    verified: true,
-    note: "Prompt routed through Intel TDX TEE node discovered via on-chain registry. Payment in $OPG on Base mainnet via Permit2.",
-  };
-
-  return { response: llmContent, txHash, attestation };
+      resolve({ response: result.response, txHash: processingHash ?? teePaymentAddress ?? "none", attestation });
+    });
+  });
 }
 
 export function registerRoutes(_httpServer: Server, app: Express) {
