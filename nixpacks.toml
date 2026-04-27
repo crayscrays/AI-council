@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python312", "python312Packages.pip"]
+
+[phases.install]
+cmds = [
+  "npm ci",
+  "python3.12 -m pip install --break-system-packages -r requirements.txt"
+]
+
+[start]
+cmd = "npm run start"

@@ -19,7 +19,8 @@ async function callOpenGradientTEE(
 ): Promise<{ response: string; txHash: string; attestation: object }> {
   return new Promise((resolve, reject) => {
     const scriptPath = join(process.cwd(), "server", "og_llm.py");
-    const child = spawn("python3", [scriptPath], {
+    const python = process.env.PYTHON_BIN || "python3";
+    const child = spawn(python, [scriptPath], {
       env: { ...process.env, OG_PRIVATE_KEY: privateKey, OG_MODEL },
     });
 
