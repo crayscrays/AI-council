@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "provider": "node",
+  "buildAptPackages": ["python3", "python3-pip"],
+  "steps": {
+    "install": {
+      "commands": ["...", "pip3 install -r requirements.txt"]
+    }
+  },
+  "deploy": {
+    "aptPackages": ["python3"],
+    "startCommand": "npm run start"
+  }
+}
