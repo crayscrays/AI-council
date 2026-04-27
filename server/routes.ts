@@ -55,11 +55,9 @@ async function callOpenGradientTEE(
         teeId,
         teePaymentAddress,
         processingHash,
-        // x-processing-hash from the TEE response links to the exact on-chain settlement record
         txProofUrl: processingHash
           ? `https://explorer.opengradient.ai/tx/${processingHash}`
           : null,
-        // Fallback: TEE node's registered identity on OG devnet
         teeRegistryUrl: teePaymentAddress
           ? `https://explorer.opengradient.ai/address/${teePaymentAddress}`
           : null,
