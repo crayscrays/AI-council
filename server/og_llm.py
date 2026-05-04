@@ -44,8 +44,10 @@ async def main() -> None:
     llm = og.LLM(private_key=private_key)
     llm.ensure_opg_approval(min_allowance=0.1)
 
-    # The SDK defines x-processing-hash but never reads it back.
-    # Hook into the underlying httpx client to capture it ourselves.
+    # Capture x-processing-hash as a reliable fallback — the SDK exposes
+    # data_settlement_transaction_hash (x-settlement-tx-hash) but that header
+    # is only present once the settlement tx is mined, which may not be
+    # synchronous. x-processing-hash is always returned immediately.
     processing_hashes: list[str] = []
 
     async def _capture_processing_hash(response) -> None:
@@ -76,12 +78,29 @@ async def main() -> None:
 
     await llm.close()
 
-    processing_hash = processing_hashes[-1] if processing_hashes else None
+    # Prefer the SDK's settlement tx hash; fall back to the processing hash
+    tx_hash = result.data_settlement_transaction_hash or (
+        processing_hashes[-1] if processing_hashes else None
+    )
+
+    # Debug: dump every field on the result so we can see what the API returns
+    print("\n" + "=" * 40, file=sys.stderr)
+    print(f"[DEBUG] data_settlement_transaction_hash : {result.data_settlement_transaction_hash}", file=sys.stderr)
+    print(f"[DEBUG] data_settlement_blob_id          : {result.data_settlement_blob_id}", file=sys.stderr)
+    print(f"[DEBUG] payment_hash                     : {result.payment_hash}", file=sys.stderr)
+    print(f"[DEBUG] tee_signature                    : {result.tee_signature}", file=sys.stderr)
+    print(f"[DEBUG] tee_id                           : {result.tee_id}", file=sys.stderr)
+    print(f"[DEBUG] tee_payment_address              : {result.tee_payment_address}", file=sys.stderr)
+    print(f"[DEBUG] processing_hash (header hook)    : {processing_hashes}", file=sys.stderr)
+    print(f"[DEBUG] tx_hash (resolved)               : {tx_hash}", file=sys.stderr)
+    if tx_hash:
+        print(f"Explorer: https://explorer.opengradient.ai/tx/{tx_hash}?tab=inferences", file=sys.stderr)
+    print("=" * 40, file=sys.stderr)
 
     print(json.dumps({
         "response": result.chat_output.get("content", "") if result.chat_output else "",
         "finish_reason": result.finish_reason,
-        "processing_hash": processing_hash,
+        "tx_hash": tx_hash,
         "tee_signature": result.tee_signature,
         "tee_timestamp": result.tee_timestamp,
         "tee_id": result.tee_id,

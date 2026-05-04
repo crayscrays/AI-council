@@ -8,9 +8,6 @@ import { randomBytes, createHash } from "crypto";
 import { spawn } from "child_process";
 import { join } from "path";
 
-const TOTAL_VOTERS = 1;
-const MAJORITY = 1; // need ≥1 approval to execute
-
 const OG_MODEL = process.env.OG_MODEL || "anthropic/claude-opus-4-6";
 
 async function callOpenGradientTEE(
@@ -42,10 +39,11 @@ async function callOpenGradientTEE(
         return reject(new Error(`Failed to parse og_llm.py output: ${stdout.slice(0, 400)}`));
       }
       if (result.error) return reject(new Error(`og_llm.py: ${result.error}`));
+      if (stderr) process.stderr.write(`[og_llm.py stderr]\n${stderr}\n`);
 
       const teePaymentAddress = result.tee_payment_address ?? null;
       const teeId = result.tee_id ?? null;
-      const processingHash = result.processing_hash ?? null;
+      const txHash = result.tx_hash ?? null;
       const attestation = {
         provider: "OpenGradient TEE",
         model: result.model ?? OG_MODEL,
@@ -54,9 +52,9 @@ async function callOpenGradientTEE(
         teeEndpoint: result.tee_endpoint ?? "via on-chain registry",
         teeId,
         teePaymentAddress,
-        processingHash,
-        txProofUrl: processingHash
-          ? `https://explorer.opengradient.ai/tx/${processingHash}`
+        txHash,
+        blockExplorer: txHash
+          ? `https://explorer.opengradient.ai/tx/${txHash}?tab=inferences`
           : null,
         teeRegistryUrl: teePaymentAddress
           ? `https://explorer.opengradient.ai/address/${teePaymentAddress}`
@@ -65,12 +63,17 @@ async function callOpenGradientTEE(
         teeTimestamp: result.tee_timestamp ?? null,
         timestamp: new Date().toISOString(),
         verified: !!(result.tee_signature),
-        note: processingHash
-          ? "txProofUrl links to the exact on-chain inference record (input + output + signature) settled via INDIVIDUAL_FULL mode."
+        note: txHash
+          ? "blockExplorer links to the exact on-chain inference record (input + output + signature) settled via INDIVIDUAL_FULL mode."
           : "teeSignature is an RSA-PSS signature over the response produced inside the Intel TDX enclave. teeRegistryUrl shows the TEE node's on-chain identity.",
       };
 
-      resolve({ response: result.response, txHash: processingHash ?? teePaymentAddress ?? "none", attestation });
+      if (attestation.blockExplorer) {
+        console.log(`\n[OpenGradient] Settlement tx: ${txHash}`);
+        console.log(`[OpenGradient] Explorer: ${attestation.blockExplorer}\n`);
+      }
+
+      resolve({ response: result.response, txHash: txHash ?? teePaymentAddress ?? "none", attestation });
     });
   });
 }
@@ -81,9 +84,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     const { provider } = req.params;
     let session = storage.getActiveSession(provider) ?? storage.getLatestSession(provider);
     if (!session) session = storage.createSession(provider);
-    const votes = storage.getVotesForSession(session.id);
     const attestation = session.attestationReport ? JSON.parse(session.attestationReport) : null;
-    res.json({ session, votes, attestation });
+    res.json({ session, attestation });
   });
 
   // POST /api/:provider/session/:id/prompt
@@ -98,53 +100,12 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     if (session.status !== "drafting") return res.status(400).json({ error: "Session is not in drafting phase" });
 
     const updated = storage.updateSession(sessionId, {
-      status: "voting",
+      status: "executing",
       prompt: parsed.data.prompt,
       mergedPrompt: parsed.data.prompt,
     });
+    executeTEE(sessionId, provider).catch(console.error);
     res.json({ session: updated });
-  });
-
-  // POST /api/:provider/session/:id/vote
-  app.post("/api/:provider/session/:id/vote", async (req, res) => {
-    const { provider } = req.params;
-    const sessionId = parseInt(req.params.id);
-    const parsed = z.object({
-      userId: z.number().min(1).max(10),
-      userName: z.string().min(1).max(50),
-      approve: z.boolean(),
-    }).safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-
-    const session = storage.getActiveSession(provider);
-    if (!session || session.id !== sessionId) return res.status(404).json({ error: "Session not found" });
-    if (session.status !== "voting") return res.status(400).json({ error: "Session is not in voting phase" });
-
-    if (storage.getUserVote(sessionId, parsed.data.userId)) {
-      return res.status(409).json({ error: "You have already voted." });
-    }
-
-    const vote = storage.submitVote({
-      sessionId,
-      userId: parsed.data.userId,
-      userName: parsed.data.userName,
-      approve: parsed.data.approve ? 1 : 0,
-      votedAt: Date.now(),
-    });
-
-    const allVotes = storage.getVotesForSession(sessionId);
-    const approveCount = allVotes.filter((v) => v.approve === 1).length;
-    const rejectCount = allVotes.filter((v) => v.approve === 0).length;
-
-    if (approveCount >= MAJORITY) {
-      storage.updateSession(sessionId, { status: "executing" });
-      executeTEE(sessionId, provider).catch(console.error);
-    }
-    if (rejectCount > TOTAL_VOTERS - MAJORITY) {
-      storage.updateSession(sessionId, { status: "drafting", prompt: null, mergedPrompt: null });
-    }
-
-    res.json({ vote, approveCount, rejectCount });
   });
 
   // GET /api/:provider/session/:id/result
@@ -152,10 +113,8 @@ export function registerRoutes(_httpServer: Server, app: Express) {
     const sessionId = parseInt(req.params.id);
     const session = db.select().from(sessionsTable).where(eq(sessionsTable.id, sessionId)).get();
     if (!session) return res.status(404).json({ error: "Session not found" });
-    const sessionVotes = storage.getVotesForSession(sessionId);
     res.json({
       session,
-      votes: sessionVotes,
       attestation: session.attestationReport ? JSON.parse(session.attestationReport) : null,
     });
   });
